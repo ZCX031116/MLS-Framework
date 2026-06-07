@@ -76,3 +76,6 @@ htmlcov/
 *~
 .DS_Store
 Thumbs.db
+
+results/
+src/__pycache__

@@ -3,12 +3,8 @@
 
 numpy
 scipy
-pandas
-torch
 networkx
+torch
 tqdm
 joblib
 tqdm-joblib
-matplotlib
-seaborn
-adjustText

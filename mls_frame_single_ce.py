@@ -1,34 +1,11 @@
-import os
-import sys
-import math
-import random
-import shutil
-import tempfile
-import warnings
-import hashlib
 from pathlib import Path
-from itertools import permutations
-from multiprocessing import Manager
-from copy import deepcopy
-import copy
 import numpy as np
-import torch
-import pandas as pd
-import networkx as nx
 from tqdm import tqdm
 from joblib import Parallel, delayed
 from tqdm_joblib import tqdm_joblib
-import matplotlib.pyplot as plt
-import seaborn as sns
 import scipy.stats as st
-from scipy.stats import gaussian_kde
-from scipy.integrate import quad
-from adjustText import adjust_text
-from collections import defaultdict, deque
-from adjustText import adjust_text
-from dataclasses import dataclass
-import json
-from src.bge import BGe
+from collections import deque
+import src.parni_dag as parni
 from src.PC_skeleton import build_H_pc_plus
 from src.parni_dag import(
     parni_prepare_context,
@@ -37,32 +14,19 @@ from src.parni_dag import(
     parni_update_pips_eq9,
 )
 from src.helper_func import (
-    pairwise_linear_ce, 
     ce_ij, 
     pairwise_linear_ce_no_params, 
     log_and_print,
-    plot_edge_frequency_and_weight_avg_graphs,
-    get_erdos_renyi_q,
     get_p_edge_for_inference,
-    build_H_topk_corr,
-    p_structure_schedule,
-    check_acyclic,
-    build_reachability,
-    level_tag,
-    atomic_json_dump,
-    summarize_array,
-    draw_graphs_in_grid,
     sample_random_graphs,
-    unique_graph_count,
-    sanity_check_weights_matrix
 )
     
-class Multilevel:
-    def __init__(self, bge_model, data, X, i, j, save_dir, output_file, max_outer_iter,
+class Multilevel_Single_CE:
+    def __init__(self, bge_model, data, X, i, j, max_outer_iter, save_dir=None, output_file=None,
                     edges_per_node = 2, params_per_graph=50, rng=None, structure_kernel = "Structure_MCMC", p_structure = 0.5,
                     ce_mode = "positive",
-                    save_level_samples: bool = True, save_level_weights: bool = True, save_level_all: bool = False,
-                    samples_dirname = "level_samples"):
+                    save_level_samples: bool = False, save_level_weights: bool = False, save_level_all: bool = False,
+                    samples_dirname = "level_samples", verbose: bool = False):
         d = data.shape[1]
         self.bge_model = bge_model
         self.no_data = (data.shape[0] == 0)
@@ -75,8 +39,9 @@ class Multilevel:
         self.j = j
         self.sigma = 1.0
         self.mu = 0.0
-        self.save_dir = save_dir
+        self.save_dir = Path(save_dir) if save_dir is not None else None
         self.output_file = output_file
+        self.verbose = bool(verbose)
         self.p_edge = get_p_edge_for_inference(d, edges_per_node)
         self.params_per_graph = params_per_graph
         self.max_outer_iter=max_outer_iter
@@ -86,10 +51,13 @@ class Multilevel:
         self.save_level_weights = bool(save_level_weights)
         self.save_level_all = bool(save_level_all)
         self.samples_dirname = str(samples_dirname)
-        self.level_samples_dir = Path(self.save_dir) / self.samples_dirname
+        self.level_samples_dir = None
         if self.save_level_samples:
+            if self.save_dir is None:
+                raise ValueError("save_dir is required when save_level_samples=True.")
+            self.level_samples_dir = self.save_dir / self.samples_dirname
             self.level_samples_dir.mkdir(parents=True, exist_ok=True)
-        self.enable_extra_sanity = True
+        self.enable_extra_sanity = False
         self.sanity_topk_edges = 8   
         self.sanity_eps = 1e-12   
 
@@ -101,7 +69,8 @@ class Multilevel:
             )
 
         if self.structure_kernel == "PARNI":
-            print("Preparing PARNI context...")
+            if self.verbose:
+                print("Preparing PARNI context...")
             X_p_n = self.data.T
             d = self.data.shape[1]
             K = min(8, d - 1)
@@ -583,14 +552,6 @@ class Multilevel:
                     level=0,
                     adapt_step=True,
                     rng=None):
-        """
-        单条链的 MCMC 抽样，返回：
-        - current_adj: 最后一个样本的邻接矩阵
-        - current_w:   最后一个样本的权重矩阵
-        - acc_rate:    整体接受率
-        - acc_structure: 仅结构 move 的接受率（非 joint kernel 时）
-        - acc_weight:     仅权重 move 的接受率（非 joint kernel 时）
-        """
         if rng is None:
             rng = np.random.default_rng()
 
@@ -800,6 +761,13 @@ class Multilevel:
             return float(self.mu), float(self.sigma)
         return mu, float(np.sqrt(var))
 
+    def _log(self, message: str) -> None:
+        if self.output_file is not None:
+            with open(self.output_file, "a") as f:
+                log_and_print(message, f, console_output=self.verbose)
+        elif self.verbose:
+            print(message)
+
     def _save_level_samples_arrays(
         self,
         iteration: int,
@@ -813,11 +781,12 @@ class Multilevel:
             return
         out_dir = getattr(self, "level_samples_dir", None)
         if out_dir is None:
-            out_dir = Path(self.save_dir) / "level_samples"
+            if self.save_dir is None:
+                raise ValueError("save_dir is required when save_level_samples=True.")
+            out_dir = self.save_dir / "level_samples"
             out_dir.mkdir(parents=True, exist_ok=True)
             self.level_samples_dir = out_dir
         it = int(iteration)
-        tag = level_tag(level_value)
         adj_arr = np.asarray(adjs, dtype=np.uint8)
         np.save(out_dir / f"{kind}_adj_iter{it:03d}.npy", adj_arr)
         if getattr(self, "save_level_weights", False) and Ws is not None:
@@ -829,50 +798,36 @@ class Multilevel:
 
     def calculate_probability(self, n, mcmc_iterations=5000):
         """
-        Multilevel (or adaptive) filtering. This only shows the same overall logic as the original,
-        with the core difference in compute_sample_graph_parallel.
-        Here, we sample (adj, w), and can still use the i->j causal effect for layered filtering.
+        Estimate log probabilities for the configured CE thresholds.
+
+        The public API is quiet by default: this method returns the log
+        probability estimates and does not write diagnostics or figures unless
+        explicit optional sample saving was enabled at construction time.
         """
-        with open(self.output_file, "a") as f:
-            log_and_print("Starting adaptive leveling...",f)
-            log_and_print(f"(T={mcmc_iterations}, n param={n}) (kernel method: {self.structure_kernel})", f)
+        self._log("Starting adaptive leveling...")
+        self._log(f"(T={mcmc_iterations}, n param={n}) (kernel method: {self.structure_kernel})")
         probability_list = []
         S = 0  
         iteration = 0
         idx_target = 0
         current_level = -np.inf
-        last_level = -np.inf
-        num_target = len(self.X)
-        suffix = f"(n={n})"
-        level_trace = []
-        trace_path = self.save_dir / f"level_trace_{suffix}.json"
         G_samples = sample_random_graphs(n, self.data.shape[1], p=self.p_edge)
         W_samples = list(self.initialize_edge_weight_matrix(G_samples))
         while True:
             if (self.max_outer_iter is not None) and (iteration >= self.max_outer_iter):
                 remaining = len(self.X) - idx_target
                 probability_list.extend([-50] * remaining)
-                print("reach max_outer_iter, break")
-                # dump level trace before returning
-                try:
-                    atomic_json_dump(level_trace, trace_path)
-                except Exception:
-                    pass
+                self._log("Reached max_outer_iter; returning floor log probabilities for unresolved targets.")
                 return probability_list
-            with open(self.output_file, "a") as f:
-                log_and_print(f"Current level (metric)={current_level} | {self._condition_str(current_level)}", f)
+            self._log(f"Current level (metric)={current_level} | {self._condition_str(current_level)}")
             iteration += 1
-            results = []
             seeds = self.rng.integers(0, 2**32 - 1, size=n, dtype=np.uint32)
 
-            with tqdm_joblib(tqdm(desc="Parallel ACE Computation", total=n)) as progress_bar:
+            with tqdm_joblib(tqdm(desc="Parallel ACE Computation", total=n, disable=not self.verbose)) as progress_bar:
                 results = Parallel(n_jobs=-1)(
                     delayed(self.compute_sample_graph_parallel)(G, W, mcmc_iterations, current_level, int(sd))
                     for (G, W, sd) in zip(G_samples, W_samples, seeds)
                 )
-            index = 0
-            tmp = 0
-            mark = True
             rho = 0.1
             k = int(np.ceil(rho * n))
             k = min(max(k, 1), n)  
@@ -881,492 +836,69 @@ class Multilevel:
             acc_rates = [r[2] for r in results]
             acc_structure_rates = [r[3] for r in results]
             acc_weight_rates = [r[4] for r in results]
-            parni_chain_diags = [r[5] for r in results]
-            parni_chain_diags = [r[5] for r in results]  # may be None for non-PARNI kernels
-            with open(self.output_file, "a") as f:
-                log_and_print(f"Average acceptance rate in this iteration: {np.mean(acc_rates)}", f)
-                log_and_print(f"Average structure acceptance rate in this iteration: {np.mean(acc_structure_rates)}", f)
-                log_and_print(f"Average weight acceptance rate in this iteration: {np.mean(acc_weight_rates)}", f)
-                if self.structure_kernel == "PARNI":
-                    try:
-                        ks = np.array([d.get("k_size_mean", 0.0) for d in parni_chain_diags if isinstance(d, dict)], dtype=float)
-                        Rs = np.array([d.get("R_mean", 0.0) for d in parni_chain_diags if isinstance(d, dict)], dtype=float)
-                        nes = np.array([d.get("n_eval_mean", 0.0) for d in parni_chain_diags if isinstance(d, dict)], dtype=float)
-                        oms = np.array([d.get("omega_thin_last", 0.0) for d in parni_chain_diags if isinstance(d, dict)], dtype=float)
-                        if ks.size:
-                            log_and_print(f"[PARNI-Diag] k_size(mean over chain) mean={float(np.mean(ks)):.3g}, q50={float(np.median(ks)):.3g}, q90={float(np.percentile(ks,90)):.3g}", f)
-                        if Rs.size:
-                            log_and_print(f"[PARNI-Diag] R(groups) mean={float(np.mean(Rs)):.3g}, q50={float(np.median(Rs)):.3g}, q90={float(np.percentile(Rs,90)):.3g}", f)
-                        if oms.size and nes.size:
-                            log_and_print(f"[PARNI-Diag] omega_thin(last) mean={float(np.mean(oms)):.3g}; n_eval(mean over chain) mean={float(np.mean(nes)):.3g}", f)
-                    except Exception as e:
-                        log_and_print(f"[PARNI-Diag] failed to aggregate: {repr(e)}", f)
-            Graph_pair_with_ace = []
+            self._log(f"Average acceptance rate in this iteration: {np.mean(acc_rates)}")
+            self._log(f"Average structure acceptance rate in this iteration: {np.mean(acc_structure_rates)}")
+            self._log(f"Average weight acceptance rate in this iteration: {np.mean(acc_weight_rates)}")
+
+            graph_pairs = []
             raw_ce_list = [ce_ij(w,self.i, self.j) for w in new_ws]
             ce_list = [self._ce_raw_to_metric(rc) for rc in raw_ce_list]
             for adj, w, ce, raw_ce in zip(new_adjs, new_ws, ce_list, raw_ce_list):
-                Graph_pair_with_ace.append([ce, adj, w, raw_ce])
-            ace_list = [x[0] for x in Graph_pair_with_ace]
-            sorted_graph_pair_with_ace = sorted(Graph_pair_with_ace, key=lambda x: x[0], reverse=True)
-            next_level = sorted_graph_pair_with_ace[k - 1][0]   # kth-largest (top rho fraction threshold)
+                graph_pairs.append([ce, adj, w, raw_ce])
+            sorted_graph_pairs = sorted(graph_pairs, key=lambda x: x[0], reverse=True)
+            current_level = sorted_graph_pairs[k - 1][0]
 
-            with open(self.output_file, "a") as f:
-                log_and_print(
-                    f"Next level selected at rho={rho}: level(metric)={next_level}, k={k} | {self._condition_str(next_level)}",
-                    f
-                )
-            last_level = current_level
-            current_level = next_level
-            #-----------------------
-            bins = 30
-            plt.figure(figsize=(10, 6))
-            plt.hist(ace_list, bins=bins, color='blue', edgecolor='black', alpha=0.7)
-            plt.axvline(x=current_level, color='red', linestyle='--', linewidth=2, label=f'Current_level: {current_level}')
-            for target_value in self.X[idx_target:]:
-                plt.axvline(x=target_value, color='green', linestyle='--', linewidth=2, label=f'Target ACE: {target_value}')
-            plt.axvline(x=last_level, color='yellow', linestyle='--', linewidth=2, label=f'Last_level: {last_level}')
-            plt.title('Distribution of ACE Values (Adaptive)')
-            plt.xlabel('ACE Value')
-            plt.ylabel('Frequency')
-            plt.legend()
-            filename = f'{self.save_dir}/adaptive_ace_values_{suffix}(level={current_level}).png'
-            plt.savefig(filename)
-            plt.close()
-            #-----------------------
-            proportion = sum(1 for item in sorted_graph_pair_with_ace if item[0] >= current_level) / len(sorted_graph_pair_with_ace)
+            self._log(
+                f"Next level selected at rho={rho}: level(metric)={current_level}, "
+                f"k={k} | {self._condition_str(current_level)}"
+            )
+            proportion = sum(1 for item in sorted_graph_pairs if item[0] >= current_level) / len(sorted_graph_pairs)
             if proportion == 0:
-                try:
-                    trace_entry["idx_target_end"] = int(idx_target)
-                    level_trace.append(trace_entry)
-                    atomic_json_dump(level_trace, trace_path)
-                except Exception:
-                    pass
-                return 0
-            surv_items = [item for item in sorted_graph_pair_with_ace if item[0] >= current_level]
+                return probability_list + [-50.0] * (len(self.X) - idx_target)
+            surv_items = [item for item in sorted_graph_pairs if item[0] >= current_level]
             new_G_samples = [item[1] for item in surv_items]
             new_W_samples = [item[2] for item in surv_items]
             ace_surv_sorted = [item[0] for item in surv_items]
             if getattr(self, "save_level_samples", False):
-                try:
+                self._save_level_samples_arrays(
+                    iteration=iteration,
+                    level_value=current_level,
+                    adjs=new_G_samples,
+                    Ws=new_W_samples,
+                    ace=ace_surv_sorted,
+                    kind="survivors",
+                )
+                if getattr(self, "save_level_all", False):
                     self._save_level_samples_arrays(
                         iteration=iteration,
                         level_value=current_level,
-                        adjs=new_G_samples,
-                        Ws=new_W_samples,
-                        ace=ace_surv_sorted,
-                        kind="survivors",
+                        adjs=new_adjs,
+                        Ws=new_ws,
+                        ace=ce_list,
+                        kind="all",
                     )
-                    if getattr(self, "save_level_all", False):
-                        self._save_level_samples_arrays(
-                            iteration=iteration,
-                            level_value=current_level,
-                            adjs=new_adjs,
-                            Ws=new_ws,
-                            ace=ce_list,
-                            kind="all",
-                        )
-                except Exception as e:
-                    with open(self.output_file, "a") as f:
-                        log_and_print(f"[LevelSamples] save failed: {repr(e)}", f)            
-            # ---------------- Level trace (per-iteration diagnostics) ----------------
-            ace_arr = np.asarray(ace_list, dtype=float)
-            surv_mask = ace_arr >= current_level
-            ace_surv = ace_arr[surv_mask]
+            self._log(f"Level {current_level} survivor proportion: {proportion}")
 
-            # graph edge count summary
-            edge_counts_all = np.array([int(np.sum(np.asarray(a, dtype=int))) for a in new_adjs], dtype=float)
-            edge_counts_surv = np.array([int(np.sum(np.asarray(a, dtype=int))) for a in new_G_samples], dtype=float)
-
-            trace_entry = {
-                "iteration": int(iteration),
-                "n": int(n),
-                "rho": float(rho),
-                "k": int(k),
-                "idx_target_start": int(idx_target),
-                "last_level": float(last_level) if np.isfinite(last_level) else None,
-                "current_level": float(current_level) if np.isfinite(current_level) else None,
-                "proportion": float(proportion),
-                "S_before": float(S),
-                "S_after": float(S + np.log(proportion)) if proportion > 0 else None,
-                "acyclic_all": bool(mark),
-                "acc_rate_mean": float(np.mean(acc_rates)) if len(acc_rates) else None,
-                "acc_rate_std": float(np.std(acc_rates)) if len(acc_rates) else None,
-                "acc_structure_mean": float(np.mean(acc_structure_rates)) if len(acc_structure_rates) else None,
-                "acc_structure_std": float(np.std(acc_structure_rates)) if len(acc_structure_rates) else None,
-                "acc_weight_mean": float(np.mean(acc_weight_rates)) if len(acc_weight_rates) else None,
-                "acc_weight_std": float(np.std(acc_weight_rates)) if len(acc_weight_rates) else None,
-                "ace_all": summarize_array(ace_arr),
-                "ace_survivors": summarize_array(ace_surv),
-                "edge_counts_all": summarize_array(edge_counts_all),
-                "edge_counts_survivors": summarize_array(edge_counts_surv),
-                "unique_graphs_all": int(unique_graph_count(new_adjs)),
-                "unique_graphs_survivors": int(unique_graph_count(new_G_samples)),
-                "num_survivors": int(len(new_G_samples)),
-                "targets_resolved": [],
-            }
-
-            # ---------------- SanityCheck: Level-end survivor weight diagnostics ----------------
-            if getattr(self, "enable_extra_sanity", False):
-                try:
-                    # survivors are exactly new_G_samples/new_W_samples at this point
-                    surv_W = new_W_samples
-                    surv_G = new_G_samples
-                    m = len(surv_W)
-                    if m > 0:
-                        max_abs_list = []
-                        # track target edge stats if present
-                        target_u, target_v = int(self.i), int(self.j)
-                        tgt_present = 0
-                        tgt_w_vals = []
-                        tgt_z_vals = []
-
-                        for Gs, Ws in zip(surv_G, surv_W):
-                            Ws = np.asarray(Ws, dtype=float)
-                            max_abs_list.append(float(np.max(np.abs(Ws))))
-
-                            # target edge
-                            if int(Gs[target_u, target_v]) == 1:
-                                tgt_present += 1
-                                w_uv = float(Ws[target_u, target_v])
-                                mu_uv, sigma_uv = self._edge_mu_sigma(Gs, target_u, target_v)
-                                z = (w_uv - mu_uv) / sigma_uv if sigma_uv > 0 else np.nan
-                                tgt_w_vals.append(w_uv)
-                                tgt_z_vals.append(z)
-
-                        max_abs_arr = np.array(max_abs_list, dtype=float)
-                        q10, q50, q90 = np.percentile(max_abs_arr, [10, 50, 90])
-
-                        with open(self.output_file, "a") as f:
-                            log_and_print(
-                                f"[W1S1-Sanity-LvlEnd] iter={iteration} level={current_level:.6g} "
-                                f"survivors={m}/{n} max|W|: q10={q10:.6g} median={q50:.6g} q90={q90:.6g} "
-                                f"max={float(max_abs_arr.max()):.6g}",
-                                f
-                            )
-
-                            # target edge summary
-                            if tgt_present > 0:
-                                w_arr = np.array(tgt_w_vals, dtype=float)
-                                z_arr = np.array(tgt_z_vals, dtype=float)
-                                log_and_print(
-                                    f"[W1S1-Sanity-LvlEnd] edge({target_u}->{target_v}) present {tgt_present}/{m}: "
-                                    f"w mean={float(np.mean(w_arr)):.6g}, std={float(np.std(w_arr)):.6g}, "
-                                    f"min={float(np.min(w_arr)):.6g}, max={float(np.max(w_arr)):.6g}; "
-                                    f"z mean={float(np.nanmean(z_arr)):.3f}, min={float(np.nanmin(z_arr)):.3f}, max={float(np.nanmax(z_arr)):.3f}",
-                                    f
-                                )
-                            else:
-                                log_and_print(
-                                    f"[W1S1-Sanity-LvlEnd] edge({target_u}->{target_v}) present 0/{m} among survivors.",
-                                    f
-                                )
-
-                            # print top-|w| edges for ONE representative survivor (the top-ACE one)
-                            top_item = sorted_graph_pair_with_ace[0]
-                            top_adj, top_w = top_item[1], top_item[2]
-                            top_w = np.asarray(top_w, dtype=float)
-                            d = top_w.shape[0]
-
-                            # list all directed edges present
-                            edges_present = list(zip(*np.where(np.asarray(top_adj, dtype=int) == 1)))
-                            if edges_present:
-                                # compute abs weights and pick top-k
-                                abs_w = np.array([abs(top_w[u, v]) for (u, v) in edges_present], dtype=float)
-                                k = min(int(getattr(self, "sanity_topk_edges", 8)), len(edges_present))
-                                idxs = np.argsort(-abs_w)[:k]
-
-                                log_and_print(f"[W1S1-Sanity-LvlEnd] top-{k} |w| edges in TOP-ACE survivor:", f)
-                                for t in idxs:
-                                    u, v = edges_present[int(t)]
-                                    w_uv = float(top_w[u, v])
-                                    mu_uv, sigma_uv = self._edge_mu_sigma(top_adj, int(u), int(v))
-                                    z = (w_uv - mu_uv) / sigma_uv if sigma_uv > 0 else np.nan
-                                    log_and_print(
-                                        f"  edge({int(u)}->{int(v)}): w={w_uv:.6g}, mu={mu_uv:.6g}, sigma={sigma_uv:.6g}, z={z:.3f}",
-                                        f
-                                    )
-
-                except Exception as e:
-                    with open(self.output_file, "a") as f:
-                        log_and_print(f"[W1S1-Sanity-LvlEnd] failed: {repr(e)}", f)
-            # ----------------------------------------------------------------------
-            with open(self.output_file, "a") as f:
-                log_and_print(f"90th Percentile {current_level} proportion: {proportion}", f)
-            #-----------------------
             last_valid_idx = None
             for i, target_value in enumerate(self.X[idx_target:], start=idx_target):
                 if current_level >= target_value:
                     last_valid_idx = i
-
-                    # IMPORTANT for posterior-vs-prior sensitivity analysis:
-                    # use ALL particles that satisfy the scientific target A, not only the
-                    # top-rho survivors that define the next adaptive level. This makes the
-                    # saved samples correspond to p(G,B | D,A) or p(G,B | A), where
-                    # A = {metric CE exceeds target_value}.
-                    target_items = [item for item in sorted_graph_pair_with_ace if item[0] > target_value]
-                    count_exceed = len(target_items)
+                    count_exceed = sum(1 for item in sorted_graph_pairs if item[0] > target_value)
                     final_proportion = count_exceed / n
-
-                    with open(self.output_file, "a") as f:
-                        log_and_print(
-                            f"Level {current_level} reaches target {self._condition_str(target_value)}; "
-                            f"final proportion={final_proportion} ({count_exceed}/{n})",
-                            f
-                        )
+                    self._log(
+                        f"Level {current_level} reaches target {self._condition_str(target_value)}; "
+                        f"final proportion={final_proportion} ({count_exceed}/{n})"
+                    )
 
                     if final_proportion == 0:
-                        tmp = -50.0
+                        log_probability = -50.0
                     else:
-                        tmp = S + np.log(final_proportion)
-                    probability_list.append(tmp)
-
-                    try:
-                        trace_entry["targets_resolved"].append({
-                            "target_value": float(target_value),
-                            "count_exceed": int(count_exceed),
-                            "final_proportion": float(final_proportion),
-                            "logp": float(tmp),
-                            "probability": float(np.exp(tmp)) if tmp > -50.0 else 0.0,
-                        })
-                    except Exception:
-                        pass
-
-                    if len(target_items) > 0:
-                        # Metric CE is the value used for adaptive levels; raw CE keeps the
-                        # original signed causal effect before _ce_raw_to_metric.
-                        ce_samples = np.asarray([item[0] for item in target_items], dtype=float)
-                        raw_ce_samples = np.asarray([item[3] for item in target_items], dtype=float)
-                        gs_np = np.stack([item[1] for item in target_items])
-                        thetas_np = np.stack([item[2] for item in target_items])
-
-                        cond_label = self._condition_str(target_value, with_indices=True)
-                        raw_thr = self._metric_to_raw_threshold(target_value)
-                        if self.ce_mode == "negative":
-                            save_path = self.save_dir / f"CE_lt_{raw_thr:.4f}"
-                        else:
-                            save_path = self.save_dir / f"CE_gt_{raw_thr:.4f}"
-                        save_path.mkdir(parents=True, exist_ok=True)
-
-                        # Save the exact target-level conditional samples for the reviewer
-                        # sensitivity analysis:
-                        #   posterior run: p(G,B | D,A)
-                        #   no-data run:   p(G,B | A)
-                        # These arrays are the ones to use for edge-frequency heatmaps and
-                        # pathway-frequency summaries.
-                        np.save(save_path / "target_metric_ce_samples.npy", ce_samples)
-                        np.save(save_path / "target_raw_ce_samples.npy", raw_ce_samples)
-                        np.save(save_path / "target_graphs.npy", gs_np)
-                        np.save(save_path / "target_weights.npy", thetas_np)
-
-                        target_summary = {
-                            "condition_label": cond_label,
-                            "target_value_metric": float(target_value),
-                            "target_value_raw": float(raw_thr),
-                            "ce_mode": str(self.ce_mode),
-                            "current_level_metric": float(current_level),
-                            "last_level_metric": float(last_level) if np.isfinite(last_level) else None,
-                            "n_particles": int(n),
-                            "num_target_samples": int(count_exceed),
-                            "final_proportion": float(final_proportion),
-                            "log_probability_estimate": float(tmp),
-                            "probability_estimate": float(np.exp(tmp)) if tmp > -50.0 else 0.0,
-                            "i": int(self.i),
-                            "j": int(self.j),
-                        }
-                        try:
-                            atomic_json_dump(target_summary, save_path / "target_summary.json")
-                        except Exception as e:
-                            with open(self.output_file, "a") as f:
-                                log_and_print(f"[TargetSamples] summary save failed: {repr(e)}", f)
-
-                        with open(self.output_file, "a") as f:
-                            log_and_print(
-                                f"[TargetSamples] saved {count_exceed} target-level samples to {save_path}",
-                                f
-                            )
-
-                        plot_edge_frequency_and_weight_avg_graphs(
-                            ce_samples=ce_samples,
-                            gs_np=gs_np,
-                            thetas_np=thetas_np,
-                            i=self.i,
-                            j=self.j,
-                            threshold=target_value,
-                            save_path=save_path,
-                            file_name=self.output_file,
-                            condition_label=cond_label
-                        )
+                        log_probability = S + np.log(final_proportion)
+                    probability_list.append(log_probability)
             if last_valid_idx is not None:
                 idx_target = last_valid_idx+1 
                 if idx_target == len(self.X):
-                    np.save(self.save_dir / f"samples_graphs_level_{current_level}.npy", new_G_samples)
-                    np.save(self.save_dir / f"samples_weights_level_{current_level}.npy", new_W_samples)
-                    try:
-                        atomic_json_dump(level_trace, trace_path)
-                    except Exception:
-                        pass
                     return probability_list
-            #-----------------------
-            try:
-                trace_entry["idx_target_end"] = int(idx_target)
-                level_trace.append(trace_entry)
-                atomic_json_dump(level_trace, trace_path)
-            except Exception:
-                pass
             S += np.log(proportion)
             G_samples, W_samples, _ = self._resample_balanced(new_G_samples, new_W_samples, n)
         return np.exp(S)
-
-
-if __name__ == "__main__":
-    train_size = 1000
-    test_size = 1000
-    dataset = "synthetic"
-    mean = 0
-    for d in [4,8,16]:
-        for structure_kernel in ["Structure_MCMC"]:
-            n = 500
-            mcmc_iterations = 5000
-            results = []
-            for run_num in range(2,11):
-                result = []
-                for num in [1]:
-                    for size in [1000]:
-                        seed = random.randint(0, 10000)
-                        #seed = run_num
-                        rng = np.random.default_rng(seed)
-                        bge_model = BGe(d=d, alpha_u=10)
-                        if dataset == "synthetic":
-                            sub_dir = f"{structure_kernel}/d={d}(proof2)"
-                            base_dir = "PARNI-Structure_MCMC(mean=0)/" + sub_dir if mean==0 else "PARNI-Structure_MCMC(Gamma)/" + sub_dir
-                            save_dir = base_dir+f"/case_{num}/run_{run_num}"
-                            load_dir = f"data/mean=0/d={d}/" if mean==0 else f"data/mean=2/d={d}/"
-                            load_case_dir = load_dir + f"case{num}"
-                            G = np.load(f"{load_case_dir}/G_{d}Nodes_train_size_1000.npy")
-                            B = np.load(f"{load_case_dir}/B_{d}Nodes_train_size_1000.npy")
-                            X_train = np.load(f"{load_case_dir}/train_{d}Nodes_train_size_1000.npy")
-                            X_train = X_train[:0, :].copy()
-                            true_effects = np.linalg.inv(np.eye(d) - B)
-                            #ce = pairwise_linear_ce_no_params(np.copy([G]), X_train, bge_model, params_per_graph=500, avg=True, return_B=False)
-                            print("B: ", B)
-                            print("true effects: ", true_effects)
-                            #print("approx: ", ce)
-                        elif dataset == "sachs":
-                            sub_dir = f"{structure_kernel}/sachs(proof2)/case{num}"
-                            base_dir = f"PARNI-Structure_MCMC(sachs)/" + sub_dir
-                            save_dir = base_dir+f"/run_{run_num}"
-                            load_dir = f"data/sachs/"
-                            load_case_dir = load_dir
-                            G = np.load(f"{load_case_dir}/sachs_graph.npy")
-                            X_train = np.load(f"{load_case_dir}/sachs_data.npy")
-                            X_train = X_train[:0, :].copy()  
-                            #print(X_train[:5]) 
-                            #B_samples, ce = pairwise_linear_ce_no_params(np.copy([G]), X_train, bge_model, params_per_graph=5000, avg=True, return_B=True)
-                                                     
-                            # print("B_samples.shape: ", B_samples.shape)
-                            # for B_sample in B_samples:
-                            #     nonzero_indices = np.where(B_sample != 0)
-                            #     print("Non-zero elements in B_samples[0]:")
-                            #     for idx in zip(*nonzero_indices):
-                            #         print(f"  B_sample{idx} = {B_sample[idx]}")
-
-                        print("seed:",seed)
-                        print(X_train.shape)
-                        target = np.load(load_dir + "target.npy")
-                        target_value_list = np.load(load_dir + "target_value.npy")
-                        print(f"num of edges and num of nodes: {np.sum(G)}, {d}")
-                        print(target.shape)
-                        print(target_value_list.shape)
-                        target_value_list = target_value_list[num-1]
-                        target = target[num-1]
-                        i = int(target[0])
-                        j = int(target[1])
-                        #print("target ce: ",ce[i,j]) 
-                        print(target_value_list)
-                        tmp = Path(save_dir)
-                        tmp.mkdir(parents=True, exist_ok=True)
-                        if dataset == "synthetic":
-                            output_file = os.path.join(tmp, f"{structure_kernel}_case{num}_run{run_num}_output_results.txt")
-                        elif dataset == "sachs":
-                            output_file = os.path.join(tmp, f"{structure_kernel}_run{run_num}_output_results.txt")
-                        ce_mode = "positive" if target_value_list[0] >= 0 else "negative"
-                        multilevel_model = Multilevel(
-                            bge_model, X_train, target_value_list, i, j, tmp, output_file, 
-                            max_outer_iter=10, 
-                            rng=rng, 
-                            structure_kernel = structure_kernel,
-                            p_structure = p_structure_schedule(d, T=mcmc_iterations),
-                            ce_mode = ce_mode,
-                        )
-                        probability_list = multilevel_model.calculate_probability(n, mcmc_iterations)
-                        with open(output_file, "a") as f:
-                            if dataset == "synthetic":
-                                log_and_print(f"case {num}, run {run_num}", f)
-                                log_and_print(f"B matrix: {B}", f)
-                                log_and_print(f"True effects: {true_effects[i, j]}", f)
-                                #log_and_print(f"approx effect: {ce[i, j]}", f)
-                            elif dataset == "sachs":
-                                log_and_print(f"run {run_num}", f)
-                                #log_and_print(f"approx effect: {ce[i, j]}", f)
-                            for target_value, probability in zip(target_value_list, probability_list):
-                                log_and_print(f"------------------", f)
-                                log_and_print(f"Target value: {target_value}", f)
-                                if ce_mode == "positive":
-                                    log_and_print(f"P(ACE > {target_value})={np.exp(probability)}, e^{probability}", f)
-                                elif ce_mode == "negative":
-                                    log_and_print(f"P(ACE < {target_value})={np.exp(probability)}, e^{probability}", f)
-                        print(target_value_list)
-                        print(probability_list)
-                        result.append(np.exp(probability_list).tolist())
-                        from adjustText import adjust_text
-                        plt.figure(figsize=(8, 6))
-                        plt.plot(target_value_list, probability_list, marker='o', linestyle='-', color='b', label='P(ACE > X)')
-                        texts = []
-                        for x, y in zip(target_value_list, probability_list):
-                            text = plt.text(x, y, f"{y:.2e}", fontsize=6)
-                            texts.append(text)
-                        adjust_text(texts, arrowprops=dict(arrowstyle="->", color='gray', lw=0.5))
-                        plt.xlabel("Target Value")
-                        plt.ylabel("Probability")
-                        plt.title("Probability vs. Target Value (log Scale)")
-                        plt.legend()
-                        plt.grid()
-                        plt.savefig(save_dir + f"/probability_vs_target_value(log).png", dpi=300, bbox_inches='tight')
-                        plt.show()
-                        plt.close()
-
-                        probability_list = [np.exp(x) for x in probability_list]
-                        plt.figure(figsize=(8, 6))
-                        plt.plot(target_value_list, probability_list, marker='o', linestyle='-', color='b', label='P(ACE > X)')
-                        texts = []
-                        for x, y in zip(target_value_list, probability_list):
-                            text = plt.text(x, y, f"{y:.2e}", fontsize=6)
-                            texts.append(text)
-                        adjust_text(texts, arrowprops=dict(arrowstyle="->", color='gray', lw=0.5))
-                        plt.xlabel("Target Value")
-                        plt.ylabel("Probability")
-                        plt.title("Probability vs. Target Value (Linear Scale)")
-                        plt.legend()
-                        plt.grid()
-                        plt.savefig(save_dir + f"/probability_vs_target_value.png", dpi=300, bbox_inches='tight')
-                        plt.show()
-                        plt.close()
-                results.append(result)
-            results_path = os.path.join(base_dir, "all_results.json")
-            with open(results_path, "w") as f:
-                json.dump(results, f)
-            print(f"Results saved to {results_path}")
-
-# average running time per MLS loop for 10 runs 
-
-#PARNI:
-# d=4: 3:40
-# d=8: 5:35
-# d=16: 6:40
-# d=32: 14:36
-
-# SMC:
-# d=4: 1:05
-# d=8: 1:35
-# d=16: 3:15
-# d=32: 6:11
