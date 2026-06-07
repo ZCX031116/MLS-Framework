@@ -1221,12 +1221,6 @@ class Multilevel:
 if __name__ == "__main__":
     train_size = 1000
     test_size = 1000
-    # "PARNI","Structure_MCMC"
-    # "sachs", "synthetic"
-    # nodes = ["Raf", "Erk", "Plcg", "PKC", "PKA", "PIP2", "PIP3", "Mek", "P38", "Jnk", "Akt" ]
-    # [6,5] PIP3->PIP2
-    # [1,10] Erk->Akt
-    # [3,8] PKC->P38
     dataset = "synthetic"
     mean = 0
     for d in [4,8,16]:
