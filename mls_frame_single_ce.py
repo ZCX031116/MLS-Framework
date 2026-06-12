@@ -44,7 +44,7 @@ class Multilevel_Single_CE:
         self.verbose = bool(verbose)
         self.p_edge = get_p_edge_for_inference(d, edges_per_node)
         self.params_per_graph = params_per_graph
-        self.max_outer_iter=max_outer_iter
+        self.max_outer_iter = max_outer_iter
         self.structure_kernel = structure_kernel
         self.p_structure = p_structure
         self.save_level_samples = bool(save_level_samples)
@@ -57,9 +57,6 @@ class Multilevel_Single_CE:
                 raise ValueError("save_dir is required when save_level_samples=True.")
             self.level_samples_dir = self.save_dir / self.samples_dirname
             self.level_samples_dir.mkdir(parents=True, exist_ok=True)
-        self.enable_extra_sanity = False
-        self.sanity_topk_edges = 8   
-        self.sanity_eps = 1e-12   
 
         if self.no_data and self.structure_kernel == "PARNI":
             raise ValueError(
@@ -73,7 +70,6 @@ class Multilevel_Single_CE:
                 print("Preparing PARNI context...")
             X_p_n = self.data.T
             d = self.data.shape[1]
-            K = min(8, d - 1)
             H, extra_parents = build_H_pc_plus(
                 self.data,
                 alpha=0.1,
@@ -83,8 +79,6 @@ class Multilevel_Single_CE:
                 extra_parent_cap=8,
                 verbose=False,
             )
-            pips_in = 0.5
-            pips_out = 0.5
             self.parni_ctx = parni_prepare_context(
                 X_p_n=X_p_n,
                 h=self.p_edge,
@@ -93,11 +87,11 @@ class Multilevel_Single_CE:
                 kappa=0.1,      
                 omega=0.5,       
                 pips_mode="uniform",
-                pips_in=pips_in,
-                pips_out=pips_out, 
+                pips_in=0.5,
+                pips_out=0.5,
                 extra_parents=extra_parents,
             )
-            self.parni_ctx["omega_N_tilde"] = 10 if d<=16 else 20          
+            self.parni_ctx["omega_N_tilde"] = 10 if d <= 16 else 20
             self.parni_ctx["omega_adapt"] = True
             self.parni_ctx["pips_adapt"] = False
             self.parni_ctx["pips_eps"] = 0.05
@@ -112,10 +106,9 @@ class Multilevel_Single_CE:
     def _metric_to_raw_threshold(self, metric_thr):
         if self.ce_mode == "positive":
             return float(metric_thr)
-        # negative: metric = -CE, so metric >= tau  <=>  CE <= -tau
         return float(-metric_thr)
 
-    def _condition_str(self, metric_thr, with_indices = True):
+    def _condition_str(self, metric_thr, with_indices=True):
         pair = f"CE[{self.i},{self.j}]" if with_indices else "CE"
         raw_thr = self._metric_to_raw_threshold(metric_thr)
         if self.ce_mode == "positive":
@@ -137,16 +130,14 @@ class Multilevel_Single_CE:
             return X_metric, X_raw
 
         if self.ce_mode == "negative":
-            X_raw = sorted(vals, reverse=True)  # -0.1, -0.2, -0.3
-            X_metric = [-v for v in X_raw]      #  0.1,  0.2,  0.3
+            X_raw = sorted(vals, reverse=True)
+            X_metric = [-v for v in X_raw]
             return X_metric, X_raw
 
-    def _clone_parni_ctx_for_chain(self, base_ctx, burn_in = None):
-        ctx = dict(base_ctx)  # shallow copy
+    def _clone_parni_ctx_for_chain(self, base_ctx, burn_in=None):
+        ctx = dict(base_ctx)
         if "hp" in base_ctx:
             ctx["hp"] = base_ctx["hp"]
-        if "bal_fun" in base_ctx:
-            ctx["bal_fun"] = base_ctx["bal_fun"]
         for k in ("PIPs", "A", "D", "pi_tilde", "pi_hat"):
             if k in base_ctx and base_ctx[k] is not None:
                 ctx[k] = np.array(base_ctx[k], copy=True)
@@ -213,13 +204,13 @@ class Multilevel_Single_CE:
         N, d = data.shape
         R = self.R
         alpha_w = bge_model.alpha_w
-        alpha_w_prime = alpha_w + N 
+        alpha_w_prime = alpha_w + N
         for i in range(d):
             parents = np.where(adjacency_matrix[:, i])[0].tolist()
             l = len(parents) + 1 
             if not parents:
                 if np.any(weight_matrix[:, i] != 0):
-                    return -np.inf 
+                    return -np.inf
                 else:
                     continue
             R11 = R[np.ix_(parents, parents)]
@@ -229,14 +220,13 @@ class Multilevel_Single_CE:
             try:
                 R11_inv = np.linalg.inv(R11)
             except np.linalg.LinAlgError:
-                return -np.inf 
+                return -np.inf
             loc = R11_inv @ R12
             denom = R22 - R21 @ R11_inv @ R12
             if denom <= 1e-10:  
                 return -np.inf
             deg_free = alpha_w_prime - d + l
             shape_matrix = np.linalg.inv((deg_free / denom) * R11)
-            eigenvalues = np.linalg.eigvalsh(shape_matrix)
             b_i = weight_matrix[parents, i]
             try:
                 dist = st.multivariate_t(loc=loc, shape=shape_matrix, df=deg_free)
@@ -245,7 +235,7 @@ class Multilevel_Single_CE:
                 return -np.inf
         return log_p
 
-    def log_posterior_with_weights(self, adjacency_matrix, weight_matrix, mll_score = None):
+    def log_posterior_with_weights(self, adjacency_matrix, weight_matrix, mll_score=None):
         log_prior_g = self.log_graph_prior(adjacency_matrix)
         if getattr(self, "no_data", False):
             mll_score = 0.0
@@ -254,27 +244,12 @@ class Multilevel_Single_CE:
         log_post_w = self.log_post_over_weights(adjacency_matrix, weight_matrix, self.bge_model, self.data)
         return (log_prior_g + mll_score + log_post_w), log_prior_g, mll_score, log_post_w
 
-    def score_state(self, adjacency_matrix, weight_matrix, pairwise_effect=None, level=0, mll_score = None):
-        G_copy = np.array([np.copy(adjacency_matrix)])
-        if pairwise_effect is None:
-            raw_ce = ce_ij(weight_matrix, self.i, self.j)
-            pairwise_effect = self._ce_raw_to_metric(raw_ce)
-        if pairwise_effect < level:
-            return -np.inf, pairwise_effect, -np.inf, -np.inf, -np.inf
-        log_score_val,log_prior_g, mll_score,log_post_w = self.log_posterior_with_weights(
-            adjacency_matrix, weight_matrix, 
-            mll_score = mll_score
-        )
-        return log_score_val, pairwise_effect,log_post_w, log_prior_g, mll_score
-
     def initialize_edge_weight_matrix(self, adjacency_matrix):
         G_arr = np.asarray(adjacency_matrix, dtype=int)
         single_graph = (G_arr.ndim == 2)
         G_batch = G_arr[None, :, :] if single_graph else G_arr
 
         if getattr(self, "no_data", False):
-            # Prior weight initialization: B_uv ~ N(mu, sigma^2) for existing
-            # edges and B_uv = 0 for absent edges.
             Ws = np.zeros_like(G_batch, dtype=float)
             for idx, G in enumerate(G_batch):
                 W = np.zeros_like(G, dtype=float)
@@ -289,7 +264,7 @@ class Multilevel_Single_CE:
                 Ws[idx] = W
             return Ws[0] if single_graph else Ws
 
-        Bs, d_care = pairwise_linear_ce_no_params(
+        Bs, _ = pairwise_linear_ce_no_params(
             G_batch, self.data, self.bge_model,
             params_per_graph=1, avg=False, return_B=True
         )
@@ -299,8 +274,6 @@ class Multilevel_Single_CE:
         parents = np.where(adj[:, v])[0].tolist()
         if len(parents) == 0:
             return parents, None, None, None
-        # No data: posterior over weights equals the coefficient prior.  Returning
-        # None makes _sample_node_weight_block use N(mu, sigma^2).
         if getattr(self, "no_data", False):
             return parents, None, None, None
         N, d = self.data.shape
@@ -356,16 +329,16 @@ class Multilevel_Single_CE:
         d = G.shape[0]
         changed = []
         for v in range(d):
-            pa_G  = np.where(G[:, v])[0]
+            pa_G = np.where(G[:, v])[0]
             pa_Gp = np.where(Gp[:, v])[0]
             if pa_G.shape[0] != pa_Gp.shape[0] or (pa_G.shape[0] > 0 and not np.array_equal(pa_G, pa_Gp)):
                 changed.append(v)
         return changed
 
     def _refresh_weights_S1(self, G: np.ndarray, W: np.ndarray, Gp: np.ndarray, rng):
-        G  = np.asarray(G, dtype=int)
+        G = np.asarray(G, dtype=int)
         Gp = np.asarray(Gp, dtype=int)
-        W  = np.asarray(W, dtype=float)
+        W = np.asarray(W, dtype=float)
         Wp = np.array(W, copy=True)
         changed = self._changed_nodes_by_parents(G, Gp)
         for v in changed:
@@ -405,10 +378,10 @@ class Multilevel_Single_CE:
         if v >= u:
             v += 1
         if u > v:
-            u, v = v, u  # ensure u < v
+            u, v = v, u
         uv = int(A[u, v] != 0)
         vu = int(A[v, u] != 0)
-        # Pair state encoding: 0 = none, 1 = u->v, 2 = v->u
+
         if uv:
             current_state = 1
             alternatives = (0, 2)
@@ -419,19 +392,17 @@ class Multilevel_Single_CE:
             current_state = 0
             alternatives = (1, 2)
         proposed_state = alternatives[int(rng.integers(2))]
-        # ---- propose "none" (edge deletion) --------------------------------
+
         if proposed_state == 0:
             new_adj = A.copy()
             new_adj[u, v] = 0
             new_adj[v, u] = 0
             return new_adj, 0.0, 0.0
-        # ---- propose u->v ---------------------------------------------------
+
         if proposed_state == 1:
             if current_state == 2:
-                # reversing v->u -> u->v: remove v->u then check if v reaches u
                 would_cycle = _has_path(v, u, ignore_edge=(v, u))
             else:
-                # adding u->v: cycle iff v can reach u
                 would_cycle = _has_path(v, u, ignore_edge=None)
             if would_cycle:
                 return A.copy(), 0.0, 0.0
@@ -439,13 +410,11 @@ class Multilevel_Single_CE:
             new_adj[u, v] = 1
             new_adj[v, u] = 0
             return new_adj, 0.0, 0.0
-        # ---- propose v->u ---------------------------------------------------
+
         else:
             if current_state == 1:
-                # reversing u->v -> v->u: remove u->v then check if u reaches v
                 would_cycle = _has_path(u, v, ignore_edge=(u, v))
             else:
-                # adding v->u: cycle iff u can reach v
                 would_cycle = _has_path(u, v, ignore_edge=None)
             if would_cycle:
                 return A.copy(), 0.0, 0.0
@@ -462,7 +431,7 @@ class Multilevel_Single_CE:
         if rng is None:
             rng = np.random.default_rng()
         new_adj = np.asarray(adjacency_matrix, dtype=int).copy()
-        new_w   = np.asarray(weight_matrix, dtype=float).copy()
+        new_w = np.asarray(weight_matrix, dtype=float).copy()
         if len(edges) == 0:
             return new_adj, new_w, 0, 0
         cand_vs = sorted({int(v) for (_, v) in edges})
@@ -481,9 +450,7 @@ class Multilevel_Single_CE:
         if rng is None:
             rng = np.random.default_rng()
         if rng.random() < p_structure:
-            # ---- structure proposal (no weights here) ----
             new_adj, log_qG_fwd, log_qG_rev = self.propose_new_structure_only(adjacency_matrix, rng=rng)
-            # ---- S1: refresh all nodes whose parent sets changed ----
             new_w, log_qw_fwd, log_qw_rev, _changed = self._refresh_weights_S1(
                 np.asarray(adjacency_matrix, dtype=int),
                 np.asarray(weight_matrix, dtype=float),
@@ -510,18 +477,6 @@ class Multilevel_Single_CE:
             new_adj     = LA_prop.curr.astype(int)
             log_qG_fwd  = info["log_qG_fwd"]
             log_qG_rev  = info["log_qG_rev"]
-            try:
-                ctx["_last_parni_diag"] = {
-                    "k_size": float(info.get("k_raw_size", info.get("k_size", 0.0))),
-                    "R": float(info.get("k_total_groups", 0.0)),
-                    "n_eval": float(info.get("n_eval", 0.0)),
-                    "omega_thin_before": float(info.get("omega_thin_before", ctx.get("omega_thin", 0.0))),
-                    "omega_thin_after": float(info.get("omega_thin_after", ctx.get("omega_thin", 0.0))),
-                    "omega": float(info.get("omega_thin_after", ctx.get("omega_thin", 0.0))),
-                }
-            except Exception:
-                pass
-            # ---- S1: refresh all nodes whose parent sets changed ----
             new_w, log_qw_fwd, log_qw_rev, _changed = self._refresh_weights_S1(
                 old_adj,
                 np.asarray(weight_matrix, dtype=float),
@@ -550,23 +505,15 @@ class Multilevel_Single_CE:
                     iterations=5000,
                     burn_in=500,
                     level=0,
-                    adapt_step=True,
                     rng=None):
         if rng is None:
             rng = np.random.default_rng()
 
-        acceptance_ratios = []
-
         current_adj = np.array(initial_adj, copy=True)
         current_w   = np.array(initial_w, copy=True)
 
-        # Initial CE (raw) and splitting metric
-        current_raw_ce = ce_ij(current_w, self.i, self.j)
-        current_ace = self._ce_raw_to_metric(current_raw_ce)
-
         current_log_graph, p_G, p_X_G = self.log_graph_target(current_adj)
 
-        # ========= NEW: branch-specific step sizes =========
         ACC = 0
         ACC_weight = 0
         ACC_structure = 0
@@ -576,15 +523,6 @@ class Multilevel_Single_CE:
         if self.structure_kernel == "PARNI":
             parni_ctx = self._clone_parni_ctx_for_chain(self.parni_ctx, burn_in=int(burn_in))
             LA = parni_make_LA_from_G(current_adj.astype(int), parni_ctx)
-        # --- PARNI per-chain diagnostics (for outer-iter logging) ---
-        parni_diag_k = []
-        parni_diag_R = []
-        parni_diag_n_eval = []
-        parni_diag_omega = []
-        # ------------------------------------------------------------
-        # ========= NEW: 记录不同 branch 的接受率 =========
-        acc_history_weight = []  # 非 joint 时，权重 move 的接受率
-        acc_history_joint  = []  # joint kernel 时的接受率
 
         for it in range(iterations):
             if self.structure_kernel == "Structure_MCMC":
@@ -599,38 +537,19 @@ class Multilevel_Single_CE:
                 else:
                     if move_type == "weight":
                         acceptance_ratio = 1.0
-                        proposed_ace = pairwise_effect
                         log_prior_g = p_G
                         mll_score = p_X_G
                         proposed_log_graph = current_log_graph
                     else:
-                        # Collapsed MH ratio.  In no-data mode this is log p(G);
-                        # otherwise it is log p(G) + log p(D | G).
                         proposed_log_graph, log_prior_g, mll_score = self.log_graph_target(new_adj)
                         log_acceptance_ratio = (proposed_log_graph + logp_cur) - (current_log_graph + logp_prop)
                         acceptance_ratio = 1.0 if log_acceptance_ratio >= 0 else float(np.exp(log_acceptance_ratio))
-                        proposed_ace = pairwise_effect
 
             elif self.structure_kernel == "PARNI":
                 LA_prev = LA
                 new_adj, new_w, logp_prop, logp_cur, LA_prop,move = self.propose_new_state_PARNI(
                     LA, current_w, ctx=parni_ctx, rng=rng, p_structure=self.p_structure
                 )
-                # PARNI diag: capture k/R/omega/n_eval from the last structure proposal
-                if move == "structure" and isinstance(parni_ctx, dict):
-                    dlast = parni_ctx.get("_last_parni_diag", None)
-                    if isinstance(dlast, dict):
-                        if dlast.get("k_size") is not None:
-                            parni_diag_k.append(float(dlast["k_size"]))
-                        if dlast.get("R") is not None:
-                            parni_diag_R.append(float(dlast["R"]))
-                        if dlast.get("n_eval") is not None:
-                            parni_diag_n_eval.append(float(dlast["n_eval"]))
-                        # prefer omega_thin_after if present
-                        if dlast.get("omega_thin_after") is not None:
-                            parni_diag_omega.append(float(dlast["omega_thin_after"]))
-                        elif dlast.get("omega") is not None:
-                            parni_diag_omega.append(float(dlast["omega"]))
                 move_type = move 
                 LA_prop_llh = float(LA_prop.llh)
                 raw_ce = ce_ij(new_w, self.i, self.j)
@@ -641,7 +560,6 @@ class Multilevel_Single_CE:
                 else:
                     if move_type == "weight":
                         acceptance_ratio = 1.0
-                        proposed_ace = pairwise_effect
                         log_prior_g = p_G
                         mll_score = p_X_G
                         proposed_log_graph = current_log_graph
@@ -655,14 +573,11 @@ class Multilevel_Single_CE:
                         proposed_log_graph = log_prior_g + mll_score
                         log_acceptance_ratio = (proposed_log_graph + logp_cur) - (current_log_graph + logp_prop)
                         acceptance_ratio = 1.0 if log_acceptance_ratio >= 0 else float(np.exp(log_acceptance_ratio))
-                        proposed_ace = pairwise_effect
 
-            # ----------------- MH accept/reject -----------------
             if rng.random() < acceptance_ratio:
                 current_adj = new_adj
                 current_w   = new_w
                 current_log_graph = proposed_log_graph
-                current_ace = proposed_ace
                 p_G = log_prior_g
                 p_X_G = mll_score
                 ACC += 1
@@ -682,33 +597,14 @@ class Multilevel_Single_CE:
                     weight_moves += 1
                 if self.structure_kernel == "PARNI":
                     LA = LA_prev
-            # ---- (D) paper §3.2 Eq(9): adaptive η / PIPs update (call AFTER MH decision) ----
             if self.structure_kernel == "PARNI" and move == "structure":
-                diag_pips = parni_update_pips_eq9(parni_ctx, LA.curr)
-            if move == "weight":
-                acc_history_weight.append(acceptance_ratio)
+                parni_update_pips_eq9(parni_ctx, LA.curr)
 
-        # ----------------- 汇总接受率 -----------------
         acc_rate = ACC / float(iterations)
         acc_structure_rate = ACC_structure / float(structure_moves) if structure_moves > 0 else 0.0
         acc_weight_rate    = ACC_weight    / float(weight_moves)    if weight_moves    > 0 else 0.0
 
-        # --- aggregate PARNI diagnostics for this chain ---
-        parni_diag = None
-        if self.structure_kernel == "PARNI":
-            try:
-                parni_diag = {
-                    "k_size_mean": float(np.mean(parni_diag_k)) if len(parni_diag_k) else 0.0,
-                    "R_mean": float(np.mean(parni_diag_R)) if len(parni_diag_R) else 0.0,
-                    "n_eval_mean": float(np.mean(parni_diag_n_eval)) if len(parni_diag_n_eval) else 0.0,
-                    "omega_thin_mean": float(np.mean(parni_diag_omega)) if len(parni_diag_omega) else (float(parni_ctx.get("omega_thin", 0.0)) if isinstance(parni_ctx, dict) else 0.0),
-                    "omega_thin_last": float(parni_ctx.get("omega_thin", 0.0)) if isinstance(parni_ctx, dict) else 0.0,
-                    "num_struct_moves": int(len(parni_diag_k)),
-                }
-            except Exception:
-                parni_diag = None
-
-        return current_adj, current_w, acc_rate, acc_structure_rate, acc_weight_rate, parni_diag
+        return current_adj, current_w, acc_rate, acc_structure_rate, acc_weight_rate
 
     def compute_sample_graph_parallel(self, G, W, mcmc_iterations, level, seed=None):
         """
@@ -716,7 +612,7 @@ class Multilevel_Single_CE:
         MCMC stage will NOT use self.rng.
         """
         rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
-        current_adj, current_w, acc_rate, acc_structure_rate, acc_weight_rate, parni_diag = self.mcmc_sampling(
+        current_adj, current_w, acc_rate, acc_structure_rate, acc_weight_rate = self.mcmc_sampling(
             initial_adj=G,
             initial_w=W,
             iterations=mcmc_iterations,
@@ -724,7 +620,7 @@ class Multilevel_Single_CE:
             level=level,
             rng=rng,
         )
-        return current_adj, current_w, acc_rate, acc_structure_rate, acc_weight_rate, parni_diag
+        return current_adj, current_w, acc_rate, acc_structure_rate, acc_weight_rate
 
     def _resample_balanced(self, G_list, W_list, n):
         K = len(G_list)
@@ -740,26 +636,6 @@ class Multilevel_Single_CE:
         G_new = [np.array(G_list[i], copy=True) for i in idx]
         W_new = [np.array(W_list[i], copy=True) for i in idx]
         return G_new, W_new, idx
-
-    def _edge_mu_sigma(self, adj: np.ndarray, u: int, v: int):
-        """
-        Return (mu, sigma) for edge u->v under CURRENT parent set of v in adj.
-        Uses node-block posterior params, and extracts the coordinate for u in Pa(v).
-        Falls back to (self.mu, self.sigma) if ill-conditioned or u not in parents.
-        """
-        parents, loc, shape, df = self._node_weight_posterior_params(adj, v)
-        if (parents is None) or (len(parents) == 0):
-            return float(self.mu), float(self.sigma)
-        if u not in parents:
-            return float(self.mu), float(self.sigma)
-        if loc is None or shape is None:
-            return float(self.mu), float(self.sigma)
-        idx = parents.index(u)
-        mu = float(loc[idx])
-        var = float(shape[idx, idx])
-        if (not np.isfinite(mu)) or (not np.isfinite(var)) or var <= 0.0:
-            return float(self.mu), float(self.sigma)
-        return mu, float(np.sqrt(var))
 
     def _log(self, message: str) -> None:
         if self.output_file is not None:
@@ -823,7 +699,7 @@ class Multilevel_Single_CE:
             iteration += 1
             seeds = self.rng.integers(0, 2**32 - 1, size=n, dtype=np.uint32)
 
-            with tqdm_joblib(tqdm(desc="Parallel ACE Computation", total=n, disable=not self.verbose)) as progress_bar:
+            with tqdm_joblib(tqdm(desc="Parallel ACE Computation", total=n, disable=not self.verbose)):
                 results = Parallel(n_jobs=-1)(
                     delayed(self.compute_sample_graph_parallel)(G, W, mcmc_iterations, current_level, int(sd))
                     for (G, W, sd) in zip(G_samples, W_samples, seeds)
