@@ -183,7 +183,6 @@ results/PARNI/multi-CE_weak/d=4/case1/run_1/
 results/PARNI/multi-CE_weak/d=4/case1/all_results.json
 results/Structure_MCMC/single-CE_synthetic/d=4/case1/run_1/
 ```
-
 The `results/` directory is ignored by Git.
 
 ## Notes
