@@ -91,6 +91,13 @@ def get_output_file(args, save_dir, structure_kernel, case_num, run_num):
     return os.path.join(save_dir, filename)
 
 
+def seed_run(seed):
+    """Seed all RNGs that can affect initialization for one run."""
+    random.seed(seed)
+    np.random.seed(seed)
+    return np.random.default_rng(seed)
+
+
 def main():
     args = parse_args()
     seed_source = random.Random(args.seed)
@@ -106,7 +113,7 @@ def main():
 
                 for case_num in args.cases:
                     seed = seed_source.randint(0, 10000)
-                    rng = np.random.default_rng(seed)
+                    rng = seed_run(seed)
                     bge_model = BGe(d=d, alpha_u=args.alpha_u)
                     load_dir, G, B, X_train = load_data(args, d, case_num)
                     target, target_value_list = load_target(load_dir, case_num)
