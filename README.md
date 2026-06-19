@@ -1,4 +1,4 @@
-# MLS-Framwork
+# MLS-Framework
 
 Code for **Interpretable Causal Discovery via Causal-Effect Constraints**.
 
