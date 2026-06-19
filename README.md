@@ -172,12 +172,6 @@ Additional `run_multi.py` arguments:
 | `--x-levels` | Comma-separated score levels. The event is `score >= L`. | `0.0` |
 | `--params-per-graph` | Number of posterior weight samples per graph for approximate CE logging. | `500` |
 
-## Reproducibility
-
-Passing `--seed` makes each repeated run deterministic by deriving a per-run seed and using it to initialize Python's `random`, NumPy's legacy RNG, and NumPy's `default_rng`.
-
-The per-run seed is written to the output log and JSON result file.
-
 ## Outputs
 
 Experiment outputs are written under `results/` by default.
