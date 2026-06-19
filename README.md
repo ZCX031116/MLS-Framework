@@ -20,3 +20,14 @@ conda create -n mls-framework python=3.10 -y
 conda activate mls-framework
 pip install -r requirements.txt
 ```
+
+### 3. Run
+```bash
+python3 run_multi.py 
+--dataset synthetic 
+--d-list 4,8 
+--cases 1 
+--constraint-names weak 
+--kernels PARNI 
+--run-num 3
+```

@@ -22,7 +22,7 @@ from src.helper_func import (
 )
     
 class Multilevel_Single_CE:
-    def __init__(self, bge_model, data, X, i, j, max_outer_iter, save_dir=None, output_file=None,
+    def __init__(self, bge_model, data, X, i, j, save_dir=None, output_file=None, max_outer_iter=10, 
                     edges_per_node = 2, params_per_graph=50, rng=None, structure_kernel = "Structure_MCMC", p_structure = 0.5,
                     ce_mode = "positive",
                     save_level_samples: bool = False, save_level_weights: bool = False, save_level_all: bool = False,
