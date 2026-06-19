@@ -63,7 +63,7 @@ def load_data(args, d, case_num):
     if args.dataset == "sachs":
         load_dir = args.data_dir / "sachs"
         G = np.load(load_dir / "sachs_graph.npy")
-        B = empty_array = np.zeros_like(G)  # Not used for Sachs, but keeping the return structure consistent
+        B = np.zeros_like(G)
         X_train = np.load(load_dir / "sachs_data.npy")
         return G, B, X_train
 
