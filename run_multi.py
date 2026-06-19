@@ -13,6 +13,7 @@ from src.helper_func import (
     log_and_print,
 )
 
+
 def _csv_ints(value):
     return [int(x) for x in value.split(",") if x.strip()]
 
@@ -63,7 +64,7 @@ def load_data(args, d, case_num):
     if args.dataset == "sachs":
         load_dir = args.data_dir / "sachs"
         G = np.load(load_dir / "sachs_graph.npy")
-        B = np.zeros_like(G)
+        B = np.zeros_like(G)  # Not used for Sachs, but keeps the return structure consistent.
         X_train = np.load(load_dir / "sachs_data.npy")
         return G, B, X_train
 
@@ -82,6 +83,13 @@ def get_save_dir(args, d, constraint_name, structure_kernel, case_num, run_num):
         )
 
     return args.results_dir / "multi-CE_sachs" / structure_kernel / f"run_{run_num}"
+
+
+def seed_run(seed):
+    """Seed all RNGs that can affect initialization for one run."""
+    random.seed(seed)
+    np.random.seed(seed)
+    return np.random.default_rng(seed)
 
 
 def main():
@@ -106,7 +114,7 @@ def main():
                     results = []
                     for run_num in range(1, args.run_num + 1):
                         seed = seed_source.randint(0, 10000)
-                        rng = np.random.default_rng(seed)
+                        rng = seed_run(seed)
                         bge_model = BGe(d=d, alpha_u=args.alpha_u)
                         save_dir = get_save_dir(args, d, name, structure_kernel, num, run_num)
                         G, B, X_train = load_data(args, d, num)
@@ -118,6 +126,7 @@ def main():
                             params_per_graph=args.params_per_graph,
                             avg=True,
                             return_B=False,
+                            rng=rng,
                         )
 
                         for (src, end, op, thr, sc) in ce_constraints:
