@@ -163,7 +163,7 @@ def main():
                                 log_and_print(f"------------------", f)
                                 log_and_print(f"Score level L: {float(L)}", f)
                                 log_and_print(f"Condition: {multilevel_model._condition_str(L)}", f)
-                                log_and_print(f"P(score >= {float(L)}) = {np.exp(logp)}, e^{logp}", f)
+                                log_and_print(f"P(score > {float(L)}) = {np.exp(logp)}, e^{logp}", f)
 
                         results.append({
                             "run": run_num,
